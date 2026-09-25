@@ -48,6 +48,8 @@ namespace KSPHarness
             public bool Warped;
             public bool Burning;
             public double BurnTime, HalfBurnTime, DvRemaining, StartUT;
+            public double NoThrustSince = -1;
+            public float WarpRequestedAt;
         }
         public static readonly NodeExecState Exec = new NodeExecState();
 
@@ -91,11 +93,75 @@ namespace KSPHarness
         /// <summary>Called every frame from Harness.Update.</summary>
         public static void Update()
         {
+            DialogWatch();
             if (!HighLogic.LoadedSceneIsFlight) { if (hooked != null) Hook(null); return; }
             var v = FlightGlobals.ActiveVessel;
             if (v != hooked) Hook(v);
             if (v == null) return;
             if (AutoStage) TryAutoStage(v);
+            Watchdog(v);
+        }
+
+        // ------------------------------------------------------------------ watchdog
+
+        static float nextWatchdog, noThrustSince = -1;
+        static bool noThrustAlerted;
+        static readonly HashSet<uint> flamedOut = new HashSet<uint>();
+        static readonly HashSet<string> knownDialogs = new HashSet<string>();
+
+        /// <summary>1 Hz anomaly detector: turns silent failure states into alert.* events.</summary>
+        static void Watchdog(Vessel v)
+        {
+            if (Time.realtimeSinceStartup < nextWatchdog) return;
+            nextWatchdog = Time.realtimeSinceStartup + 1f;
+            try
+            {
+                if (!v.packed)
+                {
+                    // throttle requested but nothing is producing thrust
+                    bool wantThrust = v.ctrlState.mainThrottle > 0.01f;
+                    bool haveThrust = CurrentPropulsion(v).Thrust > 0;
+                    if (wantThrust && !haveThrust)
+                    {
+                        if (noThrustSince < 0) noThrustSince = Time.time;
+                        if (!noThrustAlerted && Time.time - noThrustSince > 3)
+                        {
+                            noThrustAlerted = true;
+                            EventLog.Add("alert.no_thrust", "throttle " + v.ctrlState.mainThrottle.ToString("F2") + " but no engine is producing thrust (stage " + v.currentStage + (AutoStage ? ", autostage on, stop_at " + AutoStageStop : ", autostage off") + ")");
+                        }
+                    }
+                    else { noThrustSince = -1; noThrustAlerted = false; }
+
+                    foreach (var e in v.FindPartModulesImplementing<ModuleEngines>())
+                    {
+                        if (e.EngineIgnited && e.flameout)
+                        {
+                            if (flamedOut.Add(e.part.flightID))
+                                EventLog.Add("alert.flameout", e.part.partInfo.title + " flamed out" + (string.IsNullOrEmpty(e.statusL2) ? "" : " (" + e.statusL2 + ")"));
+                        }
+                        else flamedOut.Remove(e.part.flightID);
+                    }
+                }
+
+            }
+            catch (Exception e) { EventLog.Add("harness.error", "watchdog: " + e.Message); }
+        }
+
+        static float nextDialogWatch;
+
+        /// <summary>1 Hz, all scenes: report newly opened dialogs/windows as alert.dialog.</summary>
+        static void DialogWatch()
+        {
+            if (Time.realtimeSinceStartup < nextDialogWatch) return;
+            nextDialogWatch = Time.realtimeSinceStartup + 1f;
+            try
+            {
+                var titles = CmdGame.OpenDialogTitles();
+                foreach (var t in titles)
+                    if (knownDialogs.Add(t)) EventLog.Add("alert.dialog", "window opened: " + t);
+                knownDialogs.IntersectWith(titles);
+            }
+            catch (Exception e) { EventLog.Add("harness.error", "dialog watch: " + e.Message); }
         }
 
         static void TryAutoStage(Vessel v)
@@ -104,8 +170,11 @@ namespace KSPHarness
             if (Time.time < nextStageTime) return;
             if (!StageManager.CanSeparate) return;
             if (v.currentStage - 1 < AutoStageStop) return;
-            float thr = ThrottleCmd.HasValue ? (float)ThrottleCmd.Value : FlightInputHandler.state.mainThrottle;
-            if (thr <= 0) return;
+            // ctrlState is the throttle actually applied after fly-by-wire (node executor / landing set it
+            // there, not in FlightInputHandler.state).
+            float thr = Math.Max(v.ctrlState.mainThrottle, FlightInputHandler.state.mainThrottle);
+            if (ThrottleCmd.HasValue) thr = Math.Max(thr, (float)ThrottleCmd.Value);
+            if (thr <= 0 && !(Exec.Active && Exec.Burning) && !(Land.Active && Land.Burning)) return;
 
             bool anyRunning = false, anyFlameout = false;
             foreach (var e in v.FindPartModulesImplementing<ModuleEngines>())
@@ -418,20 +487,38 @@ namespace KSPHarness
                 {
                     TimeWarp.fetch.WarpTo(Exec.StartUT - Exec.LeadTime);
                     Exec.Warped = true;
+                    Exec.WarpRequestedAt = Time.realtimeSinceStartup;
                 }
+                if (Exec.Warped && TimeWarp.CurrentRateIndex == 0 && Time.realtimeSinceStartup - Exec.WarpRequestedAt > 3)
+                    Exec.Status += " (time warp refused by game, e.g. too close to the surface; waiting at 1x)";
                 return;
             }
 
             if (TimeWarp.CurrentRateIndex > 0) TimeWarp.SetRate(0, true, false);
 
+            // Burning far off schedule changes the trajectory (a late transfer burn can become an escape),
+            // so refuse rather than blindly finishing the node.
+            if (!Exec.Burning && ut > Exec.StartUT + Math.Max(30, Exec.BurnTime))
+            {
+                FinishExec(v, s, "aborted: missed burn window by " + (ut - Exec.StartUT).ToString("F0") + "s; replan the node");
+                return;
+            }
+
             if (prop.Thrust <= 0)
             {
+                if (Exec.NoThrustSince < 0) Exec.NoThrustSince = ut;
+                if (ut - Exec.NoThrustSince > 10)
+                {
+                    FinishExec(v, s, "aborted: no thrust for 10s with " + dv.ToString("F1") + " m/s left (out of fuel or staging needed); replan the node");
+                    return;
+                }
                 s.mainThrottle = 0;
                 Exec.Status = "no thrust";
                 // autostage (if enabled) will kick in once throttle is requested
                 if (AutoStage) s.mainThrottle = 1;
                 return;
             }
+            Exec.NoThrustSince = -1;
 
             if (LastErrorDeg > (Exec.Burning ? 15 : 5))
             {
@@ -454,7 +541,7 @@ namespace KSPHarness
             Exec.Active = false;
             Exec.Status = status;
             Exec.LastDir = Vector3d.zero;
-            EventLog.Add("node.exec", status + ", residual dv " + Exec.DvRemaining.ToString("F2"));
+            EventLog.Add(status.StartsWith("aborted") ? "alert.node_exec" : "node.exec", status + ", residual dv " + Exec.DvRemaining.ToString("F2"));
             AttMode = "off";
         }
 
@@ -595,6 +682,7 @@ namespace KSPHarness
             Exec.LastDir = Vector3d.zero;
             Exec.Warped = false;
             Exec.Burning = false;
+            Exec.NoThrustSince = -1;
             Exec.Status = "starting";
             ThrottleCmd = null;
         }

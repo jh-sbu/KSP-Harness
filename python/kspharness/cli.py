@@ -6,6 +6,7 @@
     ksp shot [path]                   screenshot, prints the PNG path
     ksp wait <SCENE>                  block until a scene is loaded
     ksp log [n] [grep]                tail KSP.log
+    ksp watch [until=re] [fail=re]    stream events live; exit 0 on until, 3 on alert/failure, 4 on timeout
     ksp run <routine> [key=value ...] run a high-level flight routine (see kspharness.flight)
 """
 
@@ -42,6 +43,36 @@ def emit(x) -> None:
         print(json.dumps(x, indent=1, ensure_ascii=False))
 
 
+def watch(k: KSP, until: str | None = None, fail: str = r"^alert\.|^vessel\.crash|^crew\.killed|^autopilot\.error",
+          timeout: float = 3600, since: int | None = None, quiet: str = r"^log\.|^scene\.requested") -> int:
+    """Stream game events, one per line. Exit 0 when `until` (regex on "type: msg") matches,
+    3 when `fail` matches, 4 on timeout. Designed to be run under a monitor so every event is seen live."""
+    import re
+    import time
+
+    seq = k.call("ping")["event_seq"] if since is None else since
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            evs = k.events_since(seq)
+        except KSPConnectionError:
+            time.sleep(2)  # scene loads can briefly drop the connection
+            continue
+        for e in evs:
+            seq = e["seq"]
+            line = f"{e['type']}: {e['msg']}"
+            if not re.search(quiet, e["type"]):
+                print(f"{e['real_time']} {line}", flush=True)
+            if fail and re.search(fail, line):
+                print(f"WATCH FAIL: {line}", flush=True)
+                return 3
+            if until and re.search(until, line):
+                return 0
+        time.sleep(0.5)
+    print("WATCH TIMEOUT", flush=True)
+    return 4
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv[1:] if argv is None else argv
     if not argv or argv[0] in ("-h", "--help"):
@@ -66,6 +97,8 @@ def main(argv: list[str] | None = None) -> int:
         elif cmd == "wait":
             KSP().wait_scene(rest[0])
             emit(f"{rest[0]} ready")
+        elif cmd == "watch":
+            return watch(KSP(), **parse_kv(rest))
         elif cmd == "help" and rest:
             emit(KSP().call("help", name=rest[0]))
         elif cmd == "run":

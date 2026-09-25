@@ -79,7 +79,7 @@ namespace KSPHarness
         {
             return new Dictionary<string, object>
             {
-                ["name"] = v.vesselName,
+                ["name"] = Harness.L(v.vesselName),
                 ["situation"] = v.situation.ToString(),
                 ["body"] = v.mainBody.bodyName,
                 ["altitude"] = R(v.altitude, 1),
@@ -115,7 +115,7 @@ namespace KSPHarness
             double curThrust = v.FindPartModulesImplementing<ModuleEngines>().Sum(e => (double)e.finalThrust);
             var d = new Dictionary<string, object>
             {
-                ["name"] = v.vesselName,
+                ["name"] = Harness.L(v.vesselName),
                 ["id"] = v.id.ToString(),
                 ["type"] = v.vesselType.ToString(),
                 ["situation"] = v.situation.ToString(),

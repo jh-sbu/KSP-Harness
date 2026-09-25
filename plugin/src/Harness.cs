@@ -104,7 +104,10 @@ namespace KSPHarness
     public class Harness : MonoBehaviour
     {
         public static Harness Instance;
-        public const string Version = "0.1.0";
+        public const string Version = "0.1.1";
+
+        /// <summary>Resolve localization tags such as stock craft names ("#autoLOC_501232").</summary>
+        public static string L(string s) => s != null && s.StartsWith("#") ? KSP.Localization.Localizer.Format(s) : s;
 
         static readonly Dictionary<string, MethodInfo> commands = new Dictionary<string, MethodInfo>();
         static readonly Dictionary<string, string> helps = new Dictionary<string, string>();
@@ -226,6 +229,50 @@ namespace KSPHarness
             }
 
             Autopilot.Update();
+            CaptureScreenMessages();
+        }
+
+        class TrackedMessage { public string Text; public float ChangedAt; public bool Reported; }
+        readonly Dictionary<ScreenMessage, TrackedMessage> seenMessages = new Dictionary<ScreenMessage, TrackedMessage>();
+        readonly Dictionary<string, float> lastMessageText = new Dictionary<string, float>();
+        static readonly System.Text.RegularExpressions.Regex richText = new System.Text.RegularExpressions.Regex("<[^>]+>");
+
+        /// <summary>Mirror on-screen messages (warp refusals, "can't stage", etc.) into the event log.
+        /// KSP reuses message objects and rewrites their text (the time warp notice changes every frame
+        /// while warp ramps), so a text is reported once it has been stable for 0.5s or the message goes away.</summary>
+        void CaptureScreenMessages()
+        {
+            var sm = ScreenMessages.Instance;
+            if (sm == null || sm.ActiveMessages == null) return;
+            float now = Time.realtimeSinceStartup;
+            foreach (var m in sm.ActiveMessages)
+            {
+                if (m == null) continue;
+                var raw = m.message ?? "";
+                if (!seenMessages.TryGetValue(m, out var tm) || tm.Text != raw)
+                    seenMessages[m] = new TrackedMessage { Text = raw, ChangedAt = now };
+            }
+            foreach (var kv in seenMessages.ToList())
+            {
+                bool active = sm.ActiveMessages.Contains(kv.Key);
+                var tm = kv.Value;
+                if (!tm.Reported && (!active || now - tm.ChangedAt >= 0.5f))
+                {
+                    tm.Reported = true;
+                    ReportScreenMessage(tm.Text, now);
+                }
+                if (!active) seenMessages.Remove(kv.Key);
+            }
+        }
+
+        void ReportScreenMessage(string raw, float now)
+        {
+            var text = richText.Replace(raw, "").Trim();
+            if (text.Length == 0) return;
+            // the same text re-posted repeatedly (e.g. a held warning) is reported at most every 10s
+            if (lastMessageText.TryGetValue(text, out float t) && now - t < 10) return;
+            lastMessageText[text] = now;
+            EventLog.Add("screen.message", text);
         }
 
         static string Execute(string line)
@@ -245,7 +292,7 @@ namespace KSPHarness
             }
             catch (Exception e)
             {
-                if (e is TargetInvocationException tie && tie.InnerException != null) e = tie.InnerException;
+                while (e is TargetInvocationException tie && tie.InnerException != null) e = tie.InnerException;
                 string err = e is HarnessException ? e.Message : e.GetType().Name + ": " + e.Message + "\n" + e.StackTrace;
                 return Json.Serialize(new Dictionary<string, object> { ["id"] = id, ["ok"] = false, ["error"] = err });
             }

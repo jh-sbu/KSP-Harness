@@ -136,6 +136,14 @@ namespace KSPHarness
                 else m.DeployExperiment();
                 ran.Add(m.part.partInfo.title + ": " + m.experimentID);
             }
+            // gatherData still pops the results window in 1.12; close it once it appears (data stays stored).
+            if (ran.Count > 0 && !a.Bool("keep_dialog"))
+            {
+                float until = Time.realtimeSinceStartup + 5f;
+                Harness.Instance.Defer(
+                    () => KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog.Instance != null || Time.realtimeSinceStartup > until,
+                    () => KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog.Instance?.Dismiss());
+            }
             return ran;
         }
 
@@ -190,13 +198,54 @@ namespace KSPHarness
             return "EVA: " + k.name;
         }
 
-        [Cmd("plant_flag", "Plant a flag (active vessel must be a kerbal on the surface): {name?, plaque?}")]
-        static object PlantFlag(Args a)
+        static KerbalEVA RequireEva()
         {
             var v = CmdFlight.RequireVessel();
-            var eva = v.GetComponent<KerbalEVA>() ?? throw new HarnessException("active vessel is not a kerbal on EVA");
+            return v.GetComponent<KerbalEVA>() ?? throw new HarnessException("active vessel is not a kerbal on EVA");
+        }
+
+        static readonly FieldInfo[] evaEvents = typeof(KerbalEVA).GetFields(BindingFlags.Instance | BindingFlags.Public)
+            .Where(f => f.FieldType == typeof(KFSMEvent)).ToArray();
+
+        [Cmd("eva_state", "State of the EVA kerbal: FSM state, ladder, flags carried, available FSM events.")]
+        static object EvaState(Args a)
+        {
+            var eva = RequireEva();
+            return new Dictionary<string, object>
+            {
+                ["state"] = eva.fsm.currentStateName,
+                ["on_ladder"] = eva.OnALadder,
+                ["flags"] = eva.flagItems,
+                ["jetpack"] = eva.JetpackDeployed,
+                ["situation"] = eva.vessel.situation.ToString(),
+                ["events"] = evaEvents.Select(f => f.Name).ToList(),
+            };
+        }
+
+        [Cmd("eva_event", "Run a kerbal FSM event, e.g. On_ladderLetGo, On_jump_start, On_packToggle: {event}")]
+        static object EvaEvent(Args a)
+        {
+            var eva = RequireEva();
+            var name = a.ReqStr("event");
+            var f = evaEvents.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                ?? throw new HarnessException("no FSM event '" + name + "' (see eva_state)");
+            string before = eva.fsm.currentStateName;
+            eva.fsm.RunEvent((KFSMEvent)f.GetValue(eva));
+            return new Dictionary<string, object> { ["before"] = before, ["after"] = eva.fsm.currentStateName };
+        }
+
+        [Cmd("plant_flag", "Plant a flag (active vessel must be a kerbal standing on the surface). Emits flag.planted when done.")]
+        static object PlantFlag(Args a)
+        {
+            var eva = RequireEva();
+            if (eva.OnALadder) throw new HarnessException("kerbal is on a ladder; run eva_event event=On_ladderLetGo first and wait until landed");
+            if (!eva.vessel.LandedOrSplashed) throw new HarnessException("kerbal is not on the ground (" + eva.vessel.situation + ")");
+            if (eva.flagItems <= 0) throw new HarnessException("kerbal carries no flags");
+            string before = eva.fsm.currentStateName;
             eva.PlantFlag();
-            return "planting flag";
+            string after = eva.fsm.currentStateName;
+            if (after == before) throw new HarnessException("flag planting did not start (state stays " + before + ")");
+            return new Dictionary<string, object> { ["state"] = after, ["note"] = "watch for the flag.planted event" };
         }
 
         [Cmd("board", "Board the nearest vessel with a free seat (active vessel must be a kerbal on EVA).")]
@@ -217,7 +266,7 @@ namespace KSPHarness
             }
             if (best == null) throw new HarnessException("no vessel with free seat within 50 m");
             eva.BoardPart(best);
-            return "boarding " + best.vessel.vesselName;
+            return "boarding " + Harness.L(best.vessel.vesselName);
         }
 
         // ------------------------------------------------------------------ reflection escape hatch

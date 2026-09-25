@@ -104,10 +104,19 @@ namespace KSPHarness
             if (game == null) throw new HarnessException("could not load " + save + "/" + file + ".sfs");
             HighLogic.CurrentGame = game;
             HighLogic.SaveFolder = save;
-            if (a.Bool("flight") && game.startScene == GameScenes.FLIGHT && game.flightState != null)
+            if (a.Bool("flight") && game.flightState != null && game.flightState.protoVessels.Count > 0)
             {
-                FlightDriver.StartAndFocusVessel(game, game.flightState.activeVesselIdx);
+                FlightDriver.StartAndFocusVessel(game, Math.Max(0, game.flightState.activeVesselIdx));
                 return "loading " + save + "/" + file + " into flight";
+            }
+            if (file != "persistent")
+            {
+                // The space center scene runs from 'persistent', so make the chosen save the persistent one
+                // (keeping a backup), as the stock load dialog does.
+                var dir = Path.Combine(SavesDir, save);
+                var pers = Path.Combine(dir, "persistent.sfs");
+                if (File.Exists(pers)) File.Copy(pers, Path.Combine(dir, "persistent_before_" + file + ".sfs"), true);
+                GamePersistence.SaveGame(game, "persistent", save, SaveMode.OVERWRITE);
             }
             game.startScene = GameScenes.SPACECENTER;
             game.Start();
@@ -121,7 +130,7 @@ namespace KSPHarness
             var file = a.Str("file", "persistent");
             if (HighLogic.LoadedSceneIsFlight && FlightGlobals.ClearToSave() != ClearToSaveStatus.CLEAR && !a.Bool("force"))
                 throw new HarnessException("not clear to save: " + FlightGlobals.ClearToSave() + "; pass force=true");
-            var path = GamePersistence.SaveGame(file, HighLogic.SaveFolder, SaveMode.OVERWRITE);
+            var path = GamePersistence.SaveGame(HighLogic.CurrentGame.Updated(), file, HighLogic.SaveFolder, SaveMode.OVERWRITE);
             return path;
         }
 
@@ -129,7 +138,8 @@ namespace KSPHarness
         static object QuickSave(Args a)
         {
             RequireGame();
-            return GamePersistence.SaveGame("quicksave", HighLogic.SaveFolder, SaveMode.OVERWRITE);
+            // Updated() snapshots the live flight state and records the current scene as the start scene.
+            return GamePersistence.SaveGame(HighLogic.CurrentGame.Updated(), "quicksave", HighLogic.SaveFolder, SaveMode.OVERWRITE);
         }
 
         [Cmd("quickload", "Load the quicksave into flight: {file=quicksave}")]
@@ -139,7 +149,7 @@ namespace KSPHarness
             var file = a.Str("file", "quicksave");
             var game = GamePersistence.LoadGame(file, HighLogic.SaveFolder, true, false);
             if (game == null) throw new HarnessException("no " + file + ".sfs");
-            if (game.flightState != null && game.startScene == GameScenes.FLIGHT)
+            if (game.flightState != null && game.flightState.protoVessels.Count > 0 && game.flightState.activeVesselIdx >= 0)
             {
                 HighLogic.CurrentGame = game;
                 FlightDriver.StartAndFocusVessel(game, game.flightState.activeVesselIdx);
@@ -314,7 +324,7 @@ namespace KSPHarness
             var v = CmdFlight.RequireVessel();
             if (!v.IsRecoverable && !a.Bool("force")) throw new HarnessException("vessel is not recoverable in situation " + v.situation);
             GameEvents.OnVesselRecoveryRequested.Fire(v);
-            return "recovery requested for " + v.vesselName;
+            return "recovery requested for " + Harness.L(v.vesselName);
         }
 
         [Cmd("revert", "Revert flight: {to=launch|editor}")]
@@ -375,18 +385,57 @@ namespace KSPHarness
                     ["buttons"] = new List<object> { "Cancel" },
                     ["_obj"] = w,
                 });
+            // Generic fallback: any other active UI component whose class is a *Dialog (e.g. MissionRecoveryDialog,
+            // the "Mission Summary" after recovery). Known ones above/below get richer handling.
+            var known = new HashSet<Type> { typeof(PopupDialog), typeof(LoadGameDialog), typeof(KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog) };
+            foreach (var mb in UnityEngine.Object.FindObjectsOfType<MonoBehaviour>())
+            {
+                var t = mb.GetType();
+                if (known.Contains(t) || !t.Name.EndsWith("Dialog") || !mb.isActiveAndEnabled) continue;
+                res.Add(new Dictionary<string, object>
+                {
+                    ["index"] = i++,
+                    ["name"] = t.Name,
+                    ["title"] = t.Name,
+                    ["message"] = "(unrecognized window type; dialog_click closes it via Dismiss/cancel or destroys it)",
+                    ["buttons"] = new List<object> { "Close" },
+                    ["_obj"] = mb,
+                });
+            }
+            var erd = KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog.Instance;
+            if (erd != null)
+                res.Add(new Dictionary<string, object>
+                {
+                    ["index"] = i++,
+                    ["name"] = "ExperimentsResultDialog",
+                    ["title"] = "Experiment results: " + (erd.currentPage != null ? erd.currentPage.title : ""),
+                    ["message"] = erd.currentPage != null ? erd.currentPage.resultText : "",
+                    ["buttons"] = new List<object> { "Close" },
+                    ["_obj"] = erd,
+                });
             return res;
         }
 
         /// <summary>Close a non-PopupDialog window: call its private cancel handler if any, else destroy it.</summary>
         static string CloseWindow(MonoBehaviour w)
         {
-            var m = w.GetType().GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)
-                .FirstOrDefault(x => x.Name.IndexOf("Cancel", StringComparison.OrdinalIgnoreCase) >= 0 && x.GetParameters().Length == 0);
-            if (m != null) { m.Invoke(w, null); return "cancelled via " + m.Name; }
+            var methods = w.GetType().GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly)
+                .Where(x => x.GetParameters().Length == 0).ToList();
+            var m = methods.FirstOrDefault(x => x.Name.IndexOf("Cancel", StringComparison.OrdinalIgnoreCase) >= 0)
+                ?? methods.FirstOrDefault(x => x.Name == "Dismiss" || x.Name.IndexOf("Close", StringComparison.OrdinalIgnoreCase) >= 0 || x.Name.IndexOf("Done", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (m != null)
+            {
+                try { m.Invoke(w, null); return "cancelled via " + m.Name; }
+                catch (Exception e)
+                {
+                    EventLog.Add("harness.warning", "cancel handler " + m.Name + " failed (" + (e.InnerException ?? e).Message + "); destroying window");
+                }
+            }
             UnityEngine.Object.Destroy(w.gameObject);
             return "destroyed window";
         }
+
+        public static List<string> OpenDialogTitles() => Dialogs().Select(d => (string)d["title"] ?? (string)d["name"] ?? "?").ToList();
 
         [Cmd("dialogs", "List open popup dialogs and their buttons.")]
         static object ListDialogs(Args a) =>
@@ -399,6 +448,9 @@ namespace KSPHarness
             if (all.Count == 0) throw new HarnessException("no dialogs open");
             var d = all[(int)a.Num("index", 0)];
             if (d["_obj"] is LoadGameDialog lgd) return CloseWindow(lgd);
+            if (!(d["_obj"] is PopupDialog) && !(d["_obj"] is KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog) && d["_obj"] is MonoBehaviour other)
+                return CloseWindow(other);
+            if (d["_obj"] is KSP.UI.Screens.Flight.Dialogs.ExperimentsResultDialog erd) { erd.Dismiss(); return "closed experiment results"; }
             var pd = (PopupDialog)d["_obj"];
             var btext = a.Str("button");
             if (btext == null) { pd.Dismiss(); return "dismissed"; }
@@ -451,7 +503,7 @@ namespace KSPHarness
                     var d = new Dictionary<string, object>
                     {
                         ["id"] = v.id.ToString(),
-                        ["name"] = v.vesselName,
+                        ["name"] = Harness.L(v.vesselName),
                         ["type"] = v.vesselType.ToString(),
                         ["situation"] = v.situation.ToString(),
                         ["body"] = v.mainBody.bodyName,
@@ -470,7 +522,7 @@ namespace KSPHarness
                     res.Add(new Dictionary<string, object>
                     {
                         ["id"] = pv.vesselID.ToString(),
-                        ["name"] = pv.vesselName,
+                        ["name"] = Harness.L(pv.vesselName),
                         ["type"] = pv.vesselType.ToString(),
                         ["situation"] = pv.situation.ToString(),
                         ["body"] = FlightGlobals.Bodies[pv.orbitSnapShot.ReferenceBodyIndex].bodyName,
@@ -495,20 +547,20 @@ namespace KSPHarness
             Func<string, string, bool> match = (id, name) => id == key || name.Equals(key, StringComparison.OrdinalIgnoreCase);
             if (HighLogic.LoadedSceneIsFlight)
             {
-                var v = FlightGlobals.Vessels.FirstOrDefault(x => match(x.id.ToString(), x.vesselName));
+                var v = FlightGlobals.Vessels.FirstOrDefault(x => match(x.id.ToString(), Harness.L(x.vesselName)));
                 if (v == null) throw new HarnessException("no such vessel");
-                if (v.loaded) { FlightGlobals.SetActiveVessel(v); return "switched to " + v.vesselName; }
+                if (v.loaded) { FlightGlobals.SetActiveVessel(v); return "switched to " + Harness.L(v.vesselName); }
                 GamePersistence.SaveGame("persistent", HighLogic.SaveFolder, SaveMode.OVERWRITE);
             }
             var game = GamePersistence.LoadGame("persistent", HighLogic.SaveFolder, true, false);
             HighLogic.CurrentGame = game;
             var pvs = game.flightState.protoVessels;
             int idx = -1;
-            for (int i = 0; i < pvs.Count; i++) if (match(pvs[i].vesselID.ToString(), pvs[i].vesselName)) { idx = i; break; }
+            for (int i = 0; i < pvs.Count; i++) if (match(pvs[i].vesselID.ToString(), Harness.L(pvs[i].vesselName))) { idx = i; break; }
             if (idx < 0) throw new HarnessException("no such vessel");
             Autopilot.Reset();
             FlightDriver.StartAndFocusVessel(game, idx);
-            return "loading flight for " + pvs[idx].vesselName;
+            return "loading flight for " + Harness.L(pvs[idx].vesselName);
         }
 
         [Cmd("target", "Set target: {name (body or vessel name/id)} or {clear:true}")]
@@ -518,7 +570,7 @@ namespace KSPHarness
             if (a.Bool("clear")) { FlightGlobals.fetch.SetVesselTarget(null); return "cleared"; }
             var name = a.ReqStr("name");
             ITargetable t = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName.Equals(name, StringComparison.OrdinalIgnoreCase));
-            if (t == null) t = FlightGlobals.Vessels.FirstOrDefault(v => v.id.ToString() == name || v.vesselName.Equals(name, StringComparison.OrdinalIgnoreCase));
+            if (t == null) t = FlightGlobals.Vessels.FirstOrDefault(v => v.id.ToString() == name || Harness.L(v.vesselName).Equals(name, StringComparison.OrdinalIgnoreCase));
             if (t == null) throw new HarnessException("no body or vessel named " + name);
             FlightGlobals.fetch.SetVesselTarget(t);
             return "target set to " + t.GetName();

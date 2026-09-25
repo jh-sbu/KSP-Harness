@@ -262,7 +262,7 @@ namespace KSPHarness
             var name = a.Str("target");
             if (name == null) return v.targetObject ?? throw new HarnessException("no target given or set");
             ITargetable t = FlightGlobals.Bodies.FirstOrDefault(b => b.bodyName.Equals(name, StringComparison.OrdinalIgnoreCase));
-            return t ?? FlightGlobals.Vessels.FirstOrDefault(x => x.vesselName.Equals(name, StringComparison.OrdinalIgnoreCase)) ?? throw new HarnessException("unknown target " + name);
+            return t ?? FlightGlobals.Vessels.FirstOrDefault(x => Harness.L(x.vesselName).Equals(name, StringComparison.OrdinalIgnoreCase)) ?? throw new HarnessException("unknown target " + name);
         }
 
         /// <summary>Minimum distance between two orbits around the same body within [t0,t1].</summary>

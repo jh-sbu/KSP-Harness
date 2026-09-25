@@ -10,6 +10,7 @@ from __future__ import annotations
 import math
 import sys
 import time
+from pathlib import Path
 
 from .client import KSP, KSPError
 
@@ -26,22 +27,72 @@ class EventWatch:
     """Tracks game events since construction and raises on catastrophic ones."""
 
     FATAL = ("vessel.crash", "crew.killed")
+    # Alerts that stop a routine by default: flight-safety problems that a routine can't explain.
+    # (alert.dialog is informational; alert.flameout is expected during staging.)
+    FATAL_ALERTS = ("alert.no_thrust", "alert.node_exec")
+
+    DIALOG_CHECK_INTERVAL = 10.0
 
     def __init__(self, k: KSP):
         self.k = k
         self.seq = k.call("ping")["event_seq"]
+        self._last_dialog_check = 0.0
+        self._seen_dialogs: set[str] = set()
+
+    def safe(self) -> None:
+        """Put the vessel in a passive state before aborting a routine."""
+        for cmd, kw in (("throttle", {"value": 0}), ("ap", {"mode": "off"}), ("autostage", {"on": False})):
+            try:
+                self.k.call(cmd, **kw)
+            except Exception:
+                pass
+
+    def check_dialogs(self) -> list[dict]:
+        """Log any newly opened dialog/window so stray UI never goes unnoticed."""
+        self._last_dialog_check = time.time()
+        ds = self.k.dialogs()
+        for d in ds:
+            key = f"{d['name']}|{d['title']}"
+            if key not in self._seen_dialogs:
+                self._seen_dialogs.add(key)
+                log(f"  dialog open: {d['title']!r} buttons={d['buttons']}")
+        self._seen_dialogs &= {f"{d['name']}|{d['title']}" for d in ds}
+        return ds
 
     def poll(self, fatal: bool = True) -> list[dict]:
+        if time.time() - self._last_dialog_check > self.DIALOG_CHECK_INTERVAL:
+            self.check_dialogs()
         evs = self.k.events_since(self.seq)
         if evs:
             self.seq = evs[-1]["seq"]
         for e in evs:
-            if e["type"] in ("vessel.staged", "autostage", "vessel.soi", "vessel.situation", "node.exec", "land",
+            if e["type"].startswith("alert."):
+                log(f"  ALERT {e['type']}: {e['msg']}")
+            elif e["type"] == "screen.message":
+                log(f"  on screen: {e['msg']}")
+            elif e["type"] in ("vessel.staged", "autostage", "vessel.soi", "vessel.situation", "node.exec", "land",
                              "part.destroyed", "vessel.crash", "crew.killed", "autopilot.error", "science.received"):
                 log(f"  event {e['type']}: {e['msg']}")
-            if fatal and e["type"] in self.FATAL:
+            if fatal and (e["type"] in self.FATAL or e["type"] in self.FATAL_ALERTS):
+                self.safe()
                 raise MissionError(f"{e['type']}: {e['msg']}")
         return evs
+
+
+SHOT_DIR = Path(__file__).resolve().parents[2] / "logs" / "shots"
+
+
+def milestone_shot(k: KSP, label: str) -> str | None:
+    """Save a screenshot named after a mission milestone into logs/shots/ and log its path."""
+    SHOT_DIR.mkdir(parents=True, exist_ok=True)
+    path = SHOT_DIR / f"{time.strftime('%Y%m%d_%H%M%S')}_{label}.png"
+    try:
+        p = k.screenshot(str(path))
+    except (TimeoutError, KSPError) as e:
+        log(f"  screenshot failed: {e}")
+        return None
+    log(f"  screenshot: {p}")
+    return p
 
 
 def _body(k: KSP, name: str) -> dict:
@@ -71,7 +122,9 @@ def ascend(k: KSP, altitude: float = 80000, heading: float = 90, turn_end: float
     k.autostage(on=True, stop_at=stop)
     k.ap(mode="pitch_heading", pitch=90, heading=heading)
     k.throttle(value=1)
-    if launch and v["situation"] in ("PRELAUNCH", "LANDED", "SPLASHED"):
+    # Only stage to "launch" if nothing is ignited yet (on the pad). A landed lander with an active
+    # engine must not stage: that would fire its decoupler.
+    if launch and v["situation"] in ("PRELAUNCH", "LANDED", "SPLASHED") and v["max_thrust"] == 0:
         log(f"launch: target {altitude/1000:.0f} km, heading {heading}, turn end {turn_end/1000:.0f} km, autostage down to {stop}")
         k.stage()
     h0 = v["altitude"]
@@ -107,6 +160,7 @@ def ascend(k: KSP, altitude: float = 80000, heading: float = 90, turn_end: float
         if v["situation"] in ("LANDED", "SPLASHED") and alt - h0 < 5 and spd < 1 and v["max_thrust"] == 0:
             raise MissionError("no thrust on the pad")
         time.sleep(0.2)
+    milestone_shot(k, "ascent_coast")
     log(f"out of atmosphere: ap {v['orbit']['apoapsis']/1000:.1f} km, pe {v['orbit']['periapsis']/1000:.1f} km")
     if circularize:
         return circularize_orbit(k)
@@ -124,9 +178,18 @@ def execute_node(k: KSP, tolerance: float = 0.1, warp: bool = True, timeout: flo
     k.node_exec(tolerance=tolerance, warp=warp)
     last, last_status = 0.0, ""
     t0 = time.time()
+    best_dv, best_dv_time = float("inf"), time.time()
     while True:
         watch.poll()
         st = k.ap_status()
+        # progress watchdog: while burning, remaining dv must keep shrinking
+        if st["node_exec"].startswith("burning") and "dv_remaining" in st:
+            if st["dv_remaining"] < best_dv - 0.05:
+                best_dv, best_dv_time = st["dv_remaining"], time.time()
+            elif time.time() - best_dv_time > 20:
+                k.ap(mode="off")
+                k.throttle(value=0)
+                raise MissionError(f"burn stalled: dv remaining stuck at {st['dv_remaining']} for 20s")
         if not st["node_exec"].startswith(("aligning", "burning", "realigning", "starting", "waiting", "no thrust")):
             break
         if time.time() - last > 10 or (st["node_exec"].split(",")[0] != last_status):
@@ -136,7 +199,10 @@ def execute_node(k: KSP, tolerance: float = 0.1, warp: bool = True, timeout: flo
         if time.time() - t0 > timeout:
             raise MissionError("node execution timed out")
         time.sleep(0.5)
+    if "aborted" in st["node_exec"]:
+        raise MissionError(st["node_exec"])
     log(f"node done: {st['node_exec']}")
+    milestone_shot(k, "node_done")
     o = k.vessel()["orbit"]
     log(f"orbit: ap {o['apoapsis']/1000:.1f} km, pe {o['periapsis']/1000:.1f} km, body {o['body']}")
     return o
@@ -236,6 +302,7 @@ def land(k: KSP, deorbit_periapsis: float | None = None, touch_speed: float = 1.
             log(f"  {st.get('land')}  radar {v['radar_altitude']:.0f} m  vs {v['vertical_speed']:.1f}  hs {v['horizontal_speed']:.1f}")
         time.sleep(0.3)
     v = k.vessel()
+    milestone_shot(k, "landed")
     log(f"landed: {v['situation']} on {v['body']} at {v['latitude']:.3f}, {v['longitude']:.3f} ({v['biome']})")
     return {"situation": v["situation"], "body": v["body"], "lat": v["latitude"], "lon": v["longitude"]}
 
@@ -283,8 +350,22 @@ def reenter(k: KSP, periapsis: float = 30000, stage_to_capsule: bool = True) -> 
             k.parachutes()
         time.sleep(0.5)
     k.ap(mode="off")
+    milestone_shot(k, "touchdown")
     log(f"down: {v['situation']} at {v['latitude']:.3f}, {v['longitude']:.3f}")
     return {"situation": v["situation"], "lat": v["latitude"], "lon": v["longitude"]}
+
+
+def return_home(k: KSP, periapsis: float = 30000) -> dict:
+    """From orbit around a moon: burn back to the parent planet and re-enter with parachutes."""
+    v = k.vessel()
+    k.node_clear()
+    plan = k.plan_return(periapsis=periapsis)
+    log(f"return burn: {plan['node']['dv']:.1f} m/s, parent periapsis error {plan['periapsis_error_m']} m")
+    if plan["node"]["dv"] > v["delta_v"]["total_vac"]:
+        raise MissionError(f"not enough delta-v: need {plan['node']['dv']:.0f}, have {v['delta_v']['total_vac']:.0f}")
+    execute_node(k)
+    warp_to_soi(k)
+    return reenter(k, periapsis=periapsis)
 
 
 def _time_to_altitude(k: KSP, alt: float) -> float:
@@ -317,4 +398,5 @@ ROUTINES = {
     "transfer": transfer,
     "land": land,
     "reenter": reenter,
+    "return_home": return_home,
 }

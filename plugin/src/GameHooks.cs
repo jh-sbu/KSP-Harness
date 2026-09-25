@@ -7,7 +7,7 @@ namespace KSPHarness
     {
         static bool installed;
 
-        static string VName(Vessel v) => v != null ? v.vesselName : "?";
+        static string VName(Vessel v) => v != null ? Harness.L(v.vesselName) : "?";
 
         public static void Install()
         {
@@ -27,10 +27,10 @@ namespace KSPHarness
                 if (p != null && p.vessel != null && p.vessel.loaded)
                     EventLog.Add("part.destroyed", p.partInfo != null ? p.partInfo.title : p.name, new Dictionary<string, object> { ["vessel"] = VName(p.vessel) });
             });
-            GameEvents.onVesselSituationChange.Add(e => EventLog.Add("vessel.situation", VName(e.host) + ": " + e.from + " -> " + e.to));
+            GameEvents.onVesselSituationChange.Add(e => { if (e.host != null && e.host.loaded) EventLog.Add("vessel.situation", VName(e.host) + ": " + e.from + " -> " + e.to); });
             GameEvents.onVesselSOIChanged.Add(e => EventLog.Add("vessel.soi", VName(e.host) + ": " + e.from.bodyName + " -> " + e.to.bodyName));
-            GameEvents.onVesselRecovered.Add((pv, quick) => EventLog.Add("vessel.recovered", pv != null ? pv.vesselName : "?"));
-            GameEvents.onVesselTerminated.Add(pv => EventLog.Add("vessel.terminated", pv != null ? pv.vesselName : "?"));
+            GameEvents.onVesselRecovered.Add((pv, quick) => EventLog.Add("vessel.recovered", pv != null ? Harness.L(pv.vesselName) : "?"));
+            GameEvents.onVesselTerminated.Add(pv => EventLog.Add("vessel.terminated", pv != null ? Harness.L(pv.vesselName) : "?"));
             GameEvents.OnScienceRecieved.Add((amt, subj, pv, rev) => EventLog.Add("science.received", subj.title + ": +" + amt.ToString("F1")));
             GameEvents.OnTechnologyResearched.Add(e => EventLog.Add("tech.researched", e.host.techID + " " + e.target));
             GameEvents.onFlagPlant.Add(v => EventLog.Add("flag.planted", VName(v)));
