@@ -1,0 +1,4 @@
+#!/bin/sh
+# CLI entry point: bin/ksp <command> [key=value ...]
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+PYTHONPATH="$HERE/python${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m kspharness "$@"
