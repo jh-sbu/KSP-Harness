@@ -266,9 +266,8 @@ namespace KSPHarness
         }
 
         /// <summary>Minimum distance between two orbits around the same body within [t0,t1].</summary>
-        static double MinDistance(Orbit a, Orbit b, double t0, double t1, out double tMin)
+        static double MinDistance(Orbit a, Orbit b, double t0, double t1, out double tMin, int N = 200)
         {
-            int N = 200;
             double best = double.PositiveInfinity; tMin = t0;
             for (int i = 0; i <= N; i++)
             {
@@ -388,7 +387,74 @@ namespace KSPHarness
             return result;
         }
 
-        [Cmd("plan_return", "From orbit around a moon, node to return to the parent body with a given periapsis: {periapsis=30000}")]
+        [Cmd("node_approach", "How the planned trajectory meets a body: {target, index?=last node (or current orbit if no nodes)}. Returns the encounter (periapsis, UT, inclination) if any, and the closest approach to the target along the patch that orbits the target's parent.")]
+        static object NodeApproach(Args a)
+        {
+            var v = CmdFlight.RequireVessel();
+            var body = ResolveTarget(v, a) as CelestialBody ?? throw new HarnessException("target must be a body");
+            var s = Solver(v);
+            s.UpdateFlightPlan();
+            Orbit o = v.orbit;
+            if (s.maneuverNodes.Count > 0)
+            {
+                int i = a.Has("index") ? (int)a.Num("index") : s.maneuverNodes.Count - 1;
+                o = s.maneuverNodes[i].nextPatch ?? throw new HarnessException("node has no trajectory");
+            }
+            var res = new Dictionary<string, object> { ["target"] = body.bodyName };
+            var parent = body.referenceBody;
+            int guard = 0;
+            for (; o != null && guard++ < 12; o = o.nextPatch)
+            {
+                if (o.referenceBody == body)
+                {
+                    res["encounter"] = true;
+                    res["periapsis"] = Math.Round(o.PeA, 1);
+                    res["periapsis_ut"] = Math.Round(PeUT(o), 1);
+                    res["inclination"] = Math.Round(o.inclination, 3);
+                    res["eccentricity"] = Math.Round(o.eccentricity, 5);
+                    res["soi_entry_ut"] = Math.Round(o.StartUT, 1);
+                    break;
+                }
+                if (o.referenceBody == parent && !res.ContainsKey("closest_approach"))
+                {
+                    double t0 = Math.Max(o.StartUT, Now);
+                    double t1 = o.patchEndTransition == Orbit.PatchTransitionType.FINAL || o.EndUT <= t0
+                        ? t0 + (o.eccentricity < 1 ? o.period : 1e7) : o.EndUT;
+                    double d = MinDistance(o, body.orbit, t0, t1, out double tMin, 500);
+                    res["closest_approach"] = Math.Round(d);
+                    res["closest_approach_ut"] = Math.Round(tMin, 1);
+                    // relative velocity at closest approach (for B-plane style corrections)
+                    res["relative_speed"] = Math.Round((o.getOrbitalVelocityAtUT(tMin) - body.orbit.getOrbitalVelocityAtUT(tMin)).magnitude, 2);
+                }
+                if (o.patchEndTransition == Orbit.PatchTransitionType.FINAL || o.nextPatch == null || !o.nextPatch.activePatch) break;
+            }
+            if (!res.ContainsKey("encounter")) res["encounter"] = false;
+            return res;
+        }
+
+        /// <summary>UT of the next periapsis passage on this patch (for hyperbolic patches, the only one).</summary>
+        static double PeUT(Orbit o)
+        {
+            double t0 = Math.Max(o.StartUT, Now);
+            double t1 = o.patchEndTransition == Orbit.PatchTransitionType.FINAL || o.EndUT <= t0
+                ? t0 + (o.eccentricity < 1 ? o.period : 1e7) : o.EndUT;
+            // coarse scan then golden-section refine on radius
+            int N = 400; double best = double.PositiveInfinity, tb = t0;
+            for (int i = 0; i <= N; i++)
+            {
+                double t = t0 + (t1 - t0) * i / N, r = o.getRelativePositionAtUT(t).magnitude;
+                if (r < best) { best = r; tb = t; }
+            }
+            double lo = Math.Max(t0, tb - (t1 - t0) / N), hi = Math.Min(t1, tb + (t1 - t0) / N);
+            for (int k = 0; k < 80; k++)
+            {
+                double m1 = lo + (hi - lo) * 0.382, m2 = lo + (hi - lo) * 0.618;
+                if (o.getRelativePositionAtUT(m1).magnitude < o.getRelativePositionAtUT(m2).magnitude) hi = m2; else lo = m1;
+            }
+            return (lo + hi) / 2;
+        }
+
+        [Cmd("plan_return","From orbit around a moon, node to return to the parent body with a given periapsis: {periapsis=30000}")]
         static object PlanReturn(Args a)
         {
             var v = CmdFlight.RequireVessel();

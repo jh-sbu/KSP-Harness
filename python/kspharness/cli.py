@@ -8,6 +8,7 @@
     ksp log [n] [grep]                tail KSP.log
     ksp watch [until=re] [fail=re]    stream events live; exit 0 on until, 3 on alert/failure, 4 on timeout
     ksp run <routine> [key=value ...] run a high-level flight routine (see kspharness.flight)
+    ksp build <design> [save=<folder>] write a craft file from kspharness.designs into the save's VAB folder
 """
 
 from __future__ import annotations
@@ -99,13 +100,24 @@ def main(argv: list[str] | None = None) -> int:
             emit(f"{rest[0]} ready")
         elif cmd == "watch":
             return watch(KSP(), **parse_kv(rest))
+        elif cmd == "build":
+            from . import designs
+            if not rest or rest[0] not in designs.DESIGNS:
+                raise SystemExit(f"designs: {', '.join(designs.DESIGNS)}")
+            k = KSP()
+            kv = parse_kv(rest[1:])
+            save = kv.get("save") or k.status()["game"]["save_folder"]
+            c = designs.DESIGNS[rest[0]](k)
+            path = c.save(gamectl.KSP_DIR / "saves" / save / "Ships" / "VAB" / f"{c.name}.craft")
+            emit({"path": str(path), **c.summary()})
         elif cmd == "help" and rest:
             emit(KSP().call("help", name=rest[0]))
         elif cmd == "run":
             if not rest:
                 emit({name: (fn.__doc__ or "").strip().splitlines()[0] for name, fn in flight.ROUTINES.items()})
                 return 0
-            fn = flight.ROUTINES.get(rest[0])
+            from . import mission
+            fn = {**flight.ROUTINES, "eve_mission": mission.eve_mission}.get(rest[0])
             if fn is None:
                 raise SystemExit(f"unknown routine {rest[0]}; known: {', '.join(flight.ROUTINES)}")
             result = fn(KSP(), **parse_kv(rest[1:]))

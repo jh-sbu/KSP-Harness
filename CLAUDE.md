@@ -22,12 +22,24 @@ See README.md for the command reference. Operating rules learned the hard way:
 - Don't `pkill -f` a pattern that also appears in your own command line (it kills your own shell).
 - Stock Kerbal X: the Mk16-XL chute lands the 3-seat pod at ~9 m/s, which destroys the 2.5 m heat shield
   (its crash tolerance). Crew survive, but routines raise MissionError on the part-destroyed crash event.
+- Before long unattended sessions, turn off screen blanking / screen lock in the desktop's system settings.
+  If the game hangs at startup (Player.log ends at "Desktop is ... Hz", 0% CPU), the display is probably
+  powered off: on KDE/KWin (Wayland) a new game window never gets mapped while every output is off.
+  Wake the screen and restart the game. Other desktops are untested.
+- Harness autopilot state (autostage, attitude mode) is static and survives reverts and scene changes.
+  `ascend` disables autostage before staging on the pad, and `Autopilot.Reset()` clears it.
+- Interplanetary: never trust a fixed-time Lambert solution near a 180-degree transfer (Kerbin-Eve is one).
+  The transfer plane is ill-defined and the "solution" demands huge out-of-plane burns. Eject in plane and
+  fix the plane mid-course with B-plane targeting (`course_correct`).
+- Jettison a capsule's transfer stage only shortly before the atmosphere (`reenter` does it 100 km above).
+  The decoupler's few m/s push, applied an hour out on an arrival hyperbola, moved periapsis by 25 km.
+- Warping to a far transfer window in a 100 km orbit ran much faster than 50x; always bound the search
+  window and check the planned departure date before warping.
 
 ## Known open issues (as of 2026-09-25)
 
-- Generic `*Dialog` window detection and the all-scenes `alert.dialog` watch are built but NOT yet verified
-  in game (added after the last test run). Check that it lists the post-recovery "Mission Summary"
-  (MissionRecoveryDialog), and check the frame-time cost of the 1 Hz FindObjectsOfType<MonoBehaviour>() scan.
+- Generic `*Dialog` detection is verified: it lists MissionRecoveryDialog ("Mission Summary") and
+  FlightResultsDialog. The frame-time cost of the 1 Hz FindObjectsOfType<MonoBehaviour>() scan is still unmeasured.
 - `reenter` corrects periapsis whenever it is above target, with no tolerance (spent a 0.2 m/s burn for 1.4 km).
 - `land` brakes at partial throttle along the whole stopping profile: safe but ~150 m/s more than a
   tight suicide burn on the Mun.

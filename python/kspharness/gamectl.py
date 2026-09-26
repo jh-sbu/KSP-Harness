@@ -29,8 +29,17 @@ def build_and_install() -> Path:
 
 
 def game_pids() -> list[int]:
-    out = subprocess.run(["pgrep", "-f", "KSP.x86_64"], capture_output=True, text=True).stdout
-    return [int(p) for p in out.split()]
+    # exact process name: `pgrep -f` would also match any shell whose command line mentions the binary
+    out = subprocess.run(["pgrep", "-x", "KSP.x86_64"], capture_output=True, text=True).stdout
+    pids = [int(p) for p in out.split()]
+    return [p for p in pids if not _is_zombie(p)]
+
+
+def _is_zombie(pid: int) -> bool:
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().split(") ")[1].startswith("Z")
+    except (OSError, IndexError):
+        return False
 
 
 def start(wait: bool = True, timeout: float = 600) -> str:

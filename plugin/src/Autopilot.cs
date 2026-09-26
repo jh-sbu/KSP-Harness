@@ -87,6 +87,7 @@ namespace KSPHarness
             Exec.Active = false;
             Exec.Status = "idle";
             Land.Active = false;
+            AutoStage = false;
             Raw.Clear();
         }
 

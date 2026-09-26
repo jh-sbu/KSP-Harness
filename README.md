@@ -59,16 +59,41 @@ k.plan_circularize(at="apoapsis"); k.node_exec()
 | Area | Commands |
 |---|---|
 | Game / scenes | `status`, `saves`, `new_game`, `load_game`, `save`, `quicksave`, `quickload`, `scene`, `dialogs`, `dialog_click`, `pause`, `warp` |
-| Craft | `crafts`, `craft_check`, `launch`, `recover`, `revert` |
+| Craft | `crafts`, `craft_check`, `launch`, `recover`, `revert`, `part_search`, `part_info` (attach-node geometry for the craft generator) |
 | Telemetry | `vessel`, `orbit`, `stages`, `bodies`, `vessels`, `parts`, `ap_status`, `events` |
 | Control | `throttle`, `stage`, `action_group`, `sas_mode`, `controls`, `autothrottle`, `autostage` |
 | Autopilot | `ap` (attitude hold: prograde, normal, pitch_heading, node, target…), `node_exec`, `land` |
-| Maneuvers | `nodes`, `node_add`, `node_update`, `node_clear`, `plan_circularize`, `plan_apsis`, `plan_inclination`, `plan_hohmann`, `plan_return` |
+| Maneuvers | `nodes`, `node_add`, `node_update`, `node_clear`, `plan_circularize`, `plan_apsis`, `plan_inclination`, `plan_hohmann`, `plan_return`, `node_approach` (encounter / closest approach to a body along the planned trajectory) |
 | Parts | `part_event`, `part_action`, `part_field`, `parachutes` |
 | Science / crew | `science`, `science_run`, `science_transmit`, `science_reset`, `eva`, `board`, `plant_flag`, `crew` |
 | Career | `contracts`, `contract_accept`/`decline`/`cancel`, `tech`, `tech_research`, `facilities`, `facility_upgrade` |
 | View | `screenshot`, `map`, `camera`, `switch_vessel`, `target` |
 | Escape hatch | `eval` / `set`: reflection over any static member chain, e.g. `eval expr=FlightGlobals.ActiveVessel.orbit.ApA` |
+
+## Craft design and interplanetary missions
+
+`python/kspharness/craft.py` writes `.craft` files from a short Python description (stack and
+radial-symmetry attachment, staging), using attach-node geometry read from the game. Designs live in
+`python/kspharness/designs.py`; `bin/ksp build <design>` writes one into the current save's VAB folder.
+
+`python/kspharness/interplanetary.py` does the interplanetary planning in Python (vectors in KSP's orbit
+frame, built from game state vectors):
+
+- Kepler propagation, a universal-variable Lambert solver, and a porkchop search over departure date and
+  flight time. The ejection cost includes the plane change needed when the departure asymptote is out of
+  the parking-orbit plane, and the earliest window within 25 m/s of the best is preferred.
+- Ejection geometry: the burn on the parking orbit that leaves on a hyperbola with a given v-infinity
+  vector. A differential correction reads the game's heliocentric patch at SOI exit and fixes the
+  in-plane miss (a 2-D intercept at the planned arrival time).
+- B-plane targeting for mid-course corrections: the minimum-norm burn that passes the target at the miss
+  distance for a given periapsis, prograde and near-equatorial, with free arrival time. It avoids the
+  near-180-degree Lambert singularity that makes Kerbin-Eve transfers ask for absurd plane changes.
+  `course_correct` scans burn dates across the cruise and flies the cheapest.
+
+`bin/ksp run eve_mission` flies the whole Eve round trip in the stock-parts `eve_express` design:
+wait for the window at the KSC, launch, eject, correct course, capture into a 650 km circular Eve orbit
+(above the 600 km limit for 100,000x warp), wait for the return window, eject, correct course, re-enter
+and recover. Each phase saves `eve_<phase>` first; resume with `phase=<phase>`.
 
 ## Design notes
 
