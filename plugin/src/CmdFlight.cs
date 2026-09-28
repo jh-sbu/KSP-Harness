@@ -135,6 +135,8 @@ namespace KSPHarness
                 ["horizontal_speed"] = R(v.horizontalSrfSpeed, 2),
                 ["mach"] = R(v.mach, 3),
                 ["dynamic_pressure_kpa"] = R(v.dynamicPressurekPa, 3),
+                ["drag_kn"] = R(v.parts.Sum(p => (double)p.dragScalar), 2),
+                ["max_temp_frac"] = R(v.parts.Select(p => Math.Max(p.temperature / p.maxTemp, p.skinTemperature / p.skinMaxTemp)).DefaultIfEmpty(0).Max(), 3),
                 ["static_pressure_kpa"] = R(v.staticPressurekPa, 3),
                 ["g_force"] = R(v.geeForce, 2),
                 ["local_gravity"] = R(gLocal, 3),
@@ -444,6 +446,7 @@ namespace KSPHarness
                     ["id"] = p.persistentId,
                     ["name"] = p.name,
                     ["title"] = p.partInfo.title,
+                    ["parent"] = p.parent != null ? p.parent.partInfo.name : null,
                     ["stage"] = p.inverseStage,
                     ["resources"] = p.Resources.Cast<PartResource>().ToDictionary(r => r.resourceName, r => (object)R(r.amount, 2)),
                     ["temp_ratio"] = R(Math.Max(p.temperature / p.maxTemp, p.skinTemperature / p.skinMaxTemp), 3),
@@ -521,16 +524,72 @@ namespace KSPHarness
             throw new HarnessException("no field '" + fname + "'");
         }
 
-        [Cmd("parachutes", "Deploy (arm) all parachutes: {}")]
+        [Cmd("part_bounds", "Live geometry of a part in its own local frame (renderers and colliders): {part}. Also the part's local position relative to the vessel root.")]
+        static object PartBounds(Args a)
+        {
+            var v = RequireVessel();
+            var p = FindPart(v, a.ReqStr("part"));
+            Func<IEnumerable<Bounds>, object> local = bs =>
+            {
+                Vector3 mn = Vector3.one * 1e9f, mx = -Vector3.one * 1e9f;
+                foreach (var b in bs)
+                    for (int i = 0; i < 8; i++)
+                    {
+                        var c = b.center + Vector3.Scale(b.extents, new Vector3((i & 1) == 0 ? -1 : 1, (i & 2) == 0 ? -1 : 1, (i & 4) == 0 ? -1 : 1));
+                        var l = p.transform.InverseTransformPoint(c);
+                        mn = Vector3.Min(mn, l); mx = Vector3.Max(mx, l);
+                    }
+                return new Dictionary<string, object> { ["min"] = new List<object> { R(mn.x, 2), R(mn.y, 2), R(mn.z, 2) }, ["max"] = new List<object> { R(mx.x, 2), R(mx.y, 2), R(mx.z, 2) } };
+            };
+            var root = v.rootPart.transform;
+            var rp = root.InverseTransformPoint(p.transform.position);
+            return new Dictionary<string, object>
+            {
+                ["renderers"] = local(p.GetComponentsInChildren<Renderer>().Where(r => r.enabled).Select(r => r.bounds)),
+                ["colliders"] = local(p.GetComponentsInChildren<Collider>().Where(c => c.enabled).Select(c => c.bounds)),
+                ["pos_in_root"] = new List<object> { R(rp.x, 2), R(rp.y, 2), R(rp.z, 2) },
+            };
+        }
+
+        [Cmd("temps", "Hottest parts: {n=8}. Internal and skin temperature against their limits, and whether the part is shielded from the airflow.")]
+        static object Temps(Args a)
+        {
+            var v = RequireVessel();
+            int n = (int)a.Num("n", 8);
+            return v.parts
+                .OrderByDescending(p => Math.Max(p.temperature / p.maxTemp, p.skinTemperature / p.skinMaxTemp))
+                .Take(n)
+                .Select(p => (object)new Dictionary<string, object>
+                {
+                    ["part"] = p.partInfo.name,
+                    ["temp"] = R(p.temperature, 0), ["max"] = R(p.maxTemp, 0),
+                    ["skin"] = R(p.skinTemperature, 0), ["skin_max"] = R(p.skinMaxTemp, 0),
+                    ["shielded"] = p.ShieldedFromAirstream,
+                    ["exposed_area"] = R(p.ptd != null ? p.ptd.convectionArea : -1, 2),
+                    ["conv_flux_kw"] = R(p.thermalConvectionFlux, 1),
+                    ["cond_flux_kw"] = R(p.thermalConductionFlux, 1),
+                }).ToList();
+        }
+
+        [Cmd("parachutes", "Arm stowed parachutes (they open when safe): {part?: only parts whose name contains this, exclude?: skip parts whose name contains this, parent?: only chutes attached to a part whose name contains this, not_parent?: skip chutes attached to such a part, report?:bool (just list chute states)}")]
         static object Parachutes(Args a)
         {
             var v = RequireVessel();
+            string only = a.Str("part"), exclude = a.Str("exclude"), parent = a.Str("parent"), notParent = a.Str("not_parent");
             int n = 0;
+            var states = new List<object>();
             foreach (var c in v.FindPartModulesImplementing<ModuleParachute>())
             {
-                if (c.deploymentState == ModuleParachute.deploymentStates.STOWED) { c.Deploy(); n++; }
+                var name = c.part.partInfo.name;
+                if (only != null && name.IndexOf(only, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (exclude != null && name.IndexOf(exclude, StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                var pn = c.part.parent != null ? c.part.parent.partInfo.name : "";
+                if (parent != null && pn.IndexOf(parent, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                if (notParent != null && pn.IndexOf(notParent, StringComparison.OrdinalIgnoreCase) >= 0) continue;
+                if (!a.Bool("report") && c.deploymentState == ModuleParachute.deploymentStates.STOWED) { c.Deploy(); n++; }
+                states.Add(name + " on " + pn + ": " + c.deploymentState + " (" + c.deploymentSafeState + ")");
             }
-            return n + " parachutes armed";
+            return new Dictionary<string, object> { ["armed"] = n, ["chutes"] = states };
         }
     }
 }

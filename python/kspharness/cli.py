@@ -116,8 +116,8 @@ def main(argv: list[str] | None = None) -> int:
             if not rest:
                 emit({name: (fn.__doc__ or "").strip().splitlines()[0] for name, fn in flight.ROUTINES.items()})
                 return 0
-            from . import mission
-            fn = {**flight.ROUTINES, "eve_mission": mission.eve_mission}.get(rest[0])
+            from . import devtools, mission
+            fn = {**flight.ROUTINES, **devtools.ROUTINES, "eve_mission": mission.eve_mission}.get(rest[0])
             if fn is None:
                 raise SystemExit(f"unknown routine {rest[0]}; known: {', '.join(flight.ROUTINES)}")
             result = fn(KSP(), **parse_kv(rest[1:]))

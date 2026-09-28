@@ -76,6 +76,11 @@ class Part:
         self.decouple_stage = -1    # computed: stage at which this part leaves the vessel
         self.persistent_id = random.randint(10**8, 4 * 10**9)
         self.extra: list[str] = []  # raw extra lines (e.g. MODULE blocks)
+        self.yaw = 0.0
+        self.outward: Vec | None = None  # outward normal of a radially attached part
+        self.autostrut = "Off"  # Off | Root | Heaviest | Grandparent
+        self.flip = False
+        self.rigid = False
 
     # -------------------------------------------------------------- geometry helpers
     def node(self, nid: str) -> dict:
@@ -94,11 +99,20 @@ class Part:
         return {0: 0.3125, 1: 0.625, 2: 1.25, 3: 1.875, 4: 2.5}.get(max(sizes), 0.625)
 
     # -------------------------------------------------------------- building
-    def stack(self, name: str, my_node: str = "bottom", its_node: str = "top", stage: int | None = None) -> "Part":
-        """Attach a part to one of this part's stack nodes (default: below this part)."""
+    def stack(self, name: str, my_node: str = "bottom", its_node: str = "top", stage: int | None = None,
+              my_node_y: float | None = None, flip: bool = False) -> "Part":
+        """Attach a part to one of this part's stack nodes (default: below this part). `my_node_y` overrides the
+        node height when a part variant moves it (part_info reports the prefab's default nodes). `flip` mounts the
+        child upside down (180 degrees about X; only for parts on an unrotated parent)."""
         child = Part(self.craft, name, stage)
         mn, cn = self.node(my_node), child.node(its_node)
-        child.pos = _sub(_add(self.pos, tuple(mn["pos"])), tuple(cn["pos"]))
+        mpos = tuple(mn["pos"]) if my_node_y is None else (mn["pos"][0], my_node_y, mn["pos"][2])
+        cpos = tuple(cn["pos"])
+        if flip:
+            child.flip = True
+            child.rot = (1.0, 0.0, 0.0, 0.0)
+            cpos = (cpos[0], -cpos[1], -cpos[2])
+        child.pos = _sub(_add(self.pos, mpos), cpos)
         child.parent = self
         self.children.append(child)
         self.att_nodes.append((my_node, child))
@@ -107,30 +121,66 @@ class Part:
         return child
 
     def radial(self, name: str, count: int = 1, y: float = 0.0, radius: float | None = None, angle0: float = 0.0,
-               stage: int | None = None) -> list["Part"]:
-        """Surface-attach `count` copies around this part at height `y` (part-local) with radial symmetry."""
+               stage: int | None = None, arc: float = 360.0) -> list["Part"]:
+        """Surface-attach `count` copies around this part at height `y` (part-local), spread evenly over `arc`
+        degrees starting at `angle0` (full circle: radial symmetry)."""
         r = self.radius if radius is None else radius
         out = []
         for i in range(count):
-            ang = angle0 + 360.0 * i / count
-            child = Part(self.craft, name, stage)
-            srf = child.info.get("srf_node") or {"pos": [0, 0, 0], "dir": [0, 0, -1]}
-            d = tuple(srf["dir"])
-            # yaw so that the part's srf direction maps to the outward normal at angle `ang`
+            ang = angle0 + (360.0 * i / count if arc >= 360.0 else (arc * i / (count - 1) if count > 1 else 0.0))
             normal = _rot_y((0.0, 0.0, 1.0), ang)
-            d_ang = math.degrees(math.atan2(d[0], d[2]))  # heading of the srf dir in the XZ plane (Unity yaw)
-            yaw = ang - d_ang
-            child.rot = _yaw_quat(yaw)
-            sp = _rot_y(tuple(srf["pos"]), yaw)
-            surface = (normal[0] * r, y, normal[2] * r)
-            child.pos = _sub(_add(self.pos, surface), sp)
-            child.parent = self
-            child.srf_parent = self
-            self.children.append(child)
-            self.craft.parts.append(child)
-            out.append(child)
+            surface = _add(self.pos, (normal[0] * r, y, normal[2] * r))
+            out.append(self._srf_attach(name, surface, normal, stage))
         for p in out:
             p.sym = [q for q in out if q is not p]
+        return out
+
+    def _srf_attach(self, name: str, surface: Vec, normal: Vec, stage: int | None) -> "Part":
+        """Surface-attach a part at world point `surface`, where this part's outward normal is `normal`.
+        As in the editor (see the stock Kerbal X), the child's srfAttachNode direction points back at the
+        parent, so the child is yawed to map that direction onto -normal."""
+        child = Part(self.craft, name, stage)
+        srf = child.info.get("srf_node") or {"pos": [0, 0, 0], "dir": [0, 0, -1]}
+        d = tuple(srf["dir"])
+        ang = math.degrees(math.atan2(normal[0], normal[2]))
+        d_ang = math.degrees(math.atan2(d[0], d[2]))  # heading of the srf dir in the XZ plane (Unity yaw)
+        yaw = ang + 180.0 - d_ang
+        child.rot = _yaw_quat(yaw)
+        child.yaw = yaw
+        child.outward = normal
+        child.pos = _sub(surface, _rot_y(tuple(srf["pos"]), yaw))
+        child.parent = self
+        child.srf_parent = self
+        self.children.append(child)
+        self.craft.parts.append(child)
+        return child
+
+    def side(self, name: str, depth: float, stage: int | None = None) -> "Part":
+        """Surface-attach a part to the outer face of this radially attached part (e.g. a booster tank on a
+        radial decoupler). `depth` is the distance from this part's origin to its outer face."""
+        if self.outward is None:
+            raise ValueError(f"{self.name} was not radially attached")
+        n = self.outward
+        return self._srf_attach(name, _add(self.pos, (n[0] * depth, 0.0, n[2] * depth)), n, stage)
+
+    def sym_side(parts: list["Part"], name: str, depth: float, stage: int | None = None) -> list["Part"]:
+        """side() on every part of a symmetry group; the new parts form their own symmetry group."""
+        out = [p.side(name, depth, stage) for p in parts]
+        for p in out:
+            p.sym = [q for q in out if q is not p]
+        return out
+
+    def sym_stack(parts: list["Part"], name: str, my_node: str = "bottom", its_node: str = "top",
+                  stage: int | None = None) -> list["Part"]:
+        """stack() on every part of a symmetry group, keeping the group's yaw."""
+        out = []
+        for p in parts:
+            c = p.stack(name, my_node, its_node, stage)
+            c.rot, c.yaw, c.outward = p.rot, p.yaw, p.outward
+            # stack offsets are along +Y, which the yaw leaves unchanged
+            out.append(c)
+        for c in out:
+            c.sym = [q for q in out if q is not c]
         return out
 
 
@@ -198,7 +248,9 @@ class Craft:
         by_stage: dict[int, int] = {}
         for p in self.parts:
             parent = p.parent
-            attpos0 = p.pos if parent is None else _sub(p.pos, parent.pos)
+            # attPos0/attRot0 are in the parent's frame (as the editor writes them)
+            attpos0 = p.pos if parent is None else _rot_y(_sub(p.pos, parent.pos), -parent.yaw)
+            attrot0 = p.rot if parent is None or p.flip else _yaw_quat(p.yaw - parent.yaw)
             staged = p.stage is not None
             istg = p.stage if staged else p.decouple_stage
             sidx = -1
@@ -216,11 +268,11 @@ class Craft:
                 f"\tattPos0 = {_v(attpos0)}",
                 f"\trot = {_v(p.rot)}",
                 "\tattRot = 0,0,0,1",
-                f"\tattRot0 = {_v(p.rot)}",
+                f"\tattRot0 = {_v(attrot0)}",
                 "\tmir = 1,1,1",
                 "\tsymMethod = Radial",
-                "\tautostrutMode = Off",
-                "\trigidAttachment = False",
+                f"\tautostrutMode = {p.autostrut}",
+                f"\trigidAttachment = {'True' if p.rigid else 'False'}",
                 f"\tistg = {istg}",
                 "\tresPri = 0",
                 f"\tdstg = {max(p.decouple_stage, 0)}",

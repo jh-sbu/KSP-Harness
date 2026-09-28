@@ -432,6 +432,22 @@ namespace KSPHarness
             return Describe(r, a.Bool("members"));
         }
 
+        [Cmd("find_member", "Reflection discovery: list types in Assembly-CSharp with a member named {name} (with signatures).")]
+        static object FindMember(Args a)
+        {
+            var name = a.ReqStr("name");
+            const BindingFlags F = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
+            var res = new List<object>();
+            foreach (var t in typeof(Vessel).Assembly.GetTypes())
+                foreach (var m in t.GetMembers(F))
+                    if (m.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        var mi = m as MethodInfo;
+                        res.Add(t.FullName + "." + m.Name + (mi != null ? "(" + string.Join(", ", mi.GetParameters().Select(p => p.ParameterType.Name + " " + p.Name).ToArray()) + ")" + (mi.IsStatic ? " static" : "") : " [" + m.MemberType + "]"));
+                    }
+            return res;
+        }
+
         [Cmd("set", "Reflection escape hatch: set a field/property: {expr, value}. e.g. expr=FlightGlobals.ActiveVessel.vesselName value=\"Foo\"")]
         static object Set(Args a)
         {

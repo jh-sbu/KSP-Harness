@@ -184,12 +184,42 @@ namespace KSPHarness
                 if (e.flameout || !e.isOperational) anyFlameout = true;
                 else anyRunning = true;
             }
-            if (anyFlameout || !anyRunning)
+            bool dropEmpty = !anyFlameout && anyRunning && NextStageDropsOnlyEmptyTanks(v);
+            if (anyFlameout || !anyRunning || dropEmpty)
             {
-                EventLog.Add("autostage", "autostaging from stage " + v.currentStage + (anyFlameout ? " (flameout)" : " (no running engines)"));
+                EventLog.Add("autostage", "autostaging from stage " + v.currentStage + (anyFlameout ? " (flameout)" : dropEmpty ? " (drop tanks empty)" : " (no running engines)"));
                 StageManager.ActivateNextStage();
                 nextStageTime = Time.time + 1.0f;
             }
+        }
+
+        /// <summary>True if the next stage fires decouplers whose dropped side held propellant and is now dry.
+        /// With crossfeed decouplers (asparagus without fuel lines) the boosters' engines keep drawing from the
+        /// core after their own tanks run dry, so they never flame out; this drops them when they are empty.</summary>
+        static bool NextStageDropsOnlyEmptyTanks(Vessel v)
+        {
+            int next = v.currentStage - 1;
+            bool anyTank = false;
+            foreach (var p in v.parts)
+            {
+                if (p.inverseStage != next) continue;
+                if (p.FindModuleImplementing<ModuleAnchoredDecoupler>() == null && p.FindModuleImplementing<ModuleDecouple>() == null) continue;
+                // the dropped side: everything below the decoupler in the part tree (the root is above it)
+                var stack = new Stack<Part>(p.children);
+                while (stack.Count > 0)
+                {
+                    var q = stack.Pop();
+                    foreach (var c in q.children) stack.Push(c);
+                    foreach (PartResource r in q.Resources)
+                    {
+                        if (r.resourceName != "LiquidFuel" && r.resourceName != "Oxidizer" && r.resourceName != "SolidFuel") continue;
+                        if (r.maxAmount <= 0) continue;
+                        anyTank = true;
+                        if (r.amount > 0.001 * r.maxAmount + 0.01) return false;
+                    }
+                }
+            }
+            return anyTank;
         }
 
         // ------------------------------------------------------------------ geometry

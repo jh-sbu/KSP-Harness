@@ -31,6 +31,23 @@ namespace KSPHarness
                 }).ToList();
         }
 
+        [Cmd("terrain_grid", "Terrain height above sea level on a lat/lon grid (0 over ocean): {body, lat0=-60, lat1=60, lon0=-180, lon1=180, step=1}. Returns rows by latitude.")]
+        static object TerrainGrid(Args a)
+        {
+            var b = FlightGlobals.GetBodyByName(a.ReqStr("body")) ?? throw new HarnessException("no body " + a.Str("body"));
+            double lat0 = a.Num("lat0", -60), lat1 = a.Num("lat1", 60), lon0 = a.Num("lon0", -180), lon1 = a.Num("lon1", 180), step = a.Num("step", 1);
+            if (step <= 0 || (lat1 - lat0) / step * (lon1 - lon0) / step > 400000) throw new HarnessException("grid too large");
+            var rows = new List<object>();
+            for (double lat = lat0; lat <= lat1 + 1e-9; lat += step)
+            {
+                var row = new List<object>();
+                for (double lon = lon0; lon <= lon1 + 1e-9; lon += step)
+                    row.Add(Math.Round(b.TerrainAltitude(lat, lon, false), 0));
+                rows.Add(row);
+            }
+            return new Dictionary<string, object> { ["lat0"] = lat0, ["lon0"] = lon0, ["step"] = step, ["heights"] = rows };
+        }
+
         [Cmd("part_info", "Geometry and stats of parts for craft building: {names:[part names]}")]
         static object PartInfo(Args a)
         {
@@ -63,6 +80,17 @@ namespace KSPHarness
                     ["resources"] = p.Resources.Cast<PartResource>().ToDictionary(r => r.resourceName, r => (object)R(r.maxAmount, 2)),
                     ["modules"] = p.Modules.Cast<PartModule>().Select(m => m.moduleName).ToList(),
                 };
+                try
+                {
+                    var bs = p.GetRendererBounds();
+                    if (bs.Length > 0)
+                    {
+                        var b = bs[0];
+                        foreach (var x in bs) b.Encapsulate(x);
+                        d["bounds"] = new Dictionary<string, object> { ["center"] = V(b.center - p.transform.position), ["size"] = V(b.size) };
+                    }
+                }
+                catch (Exception) { }
                 if (p.srfAttachNode != null)
                     d["srf_node"] = new Dictionary<string, object> { ["pos"] = V(p.srfAttachNode.position), ["dir"] = V(p.srfAttachNode.orientation) };
                 var eng = p.Modules.OfType<ModuleEngines>().FirstOrDefault();

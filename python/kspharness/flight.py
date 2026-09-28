@@ -73,8 +73,10 @@ class EventWatch:
             elif e["type"] == "screen.message":
                 log(f"  on screen: {e['msg']}")
             elif e["type"] in ("vessel.staged", "autostage", "vessel.soi", "vessel.situation", "node.exec", "land",
-                             "part.destroyed", "vessel.crash", "crew.killed", "autopilot.error", "science.received"):
+                             "part.destroyed", "part.joint_break", "vessel.crash", "crew.killed", "autopilot.error", "science.received"):
                 log(f"  event {e['type']}: {e['msg']}")
+            if e.get("active") is False:
+                continue  # debris or a vessel other than the one being flown
             if fatal and (e["type"] in self.FATAL or e["type"] in self.FATAL_ALERTS):
                 self.safe()
                 raise MissionError(f"{e['type']}: {e['msg']}")
@@ -101,6 +103,19 @@ def _body(k: KSP, name: str) -> dict:
     return k.bodies(name=name)[0]
 
 
+def set_control_surfaces(k: KSP, active: bool) -> int:
+    """Enable/disable the pitch/yaw/roll response of every control surface (fins). Flying tail-first (an
+    engines-first entry) a fin's deflection works backwards: the attitude controller's corrections become
+    positive feedback that grows with dynamic pressure and flips the vessel."""
+    n = 0
+    for p in k.call("parts", filter="", modules=True):
+        if any(m["module"] == "ModuleControlSurface" for m in p["modules"]):
+            k.call("part_action", part=p["id"], module="ModuleControlSurface",
+                   action="ActivateAllControls" if active else "DeactivateAllControls")
+            n += 1
+    return n
+
+
 def _last_engine_stage(k: KSP) -> int:
     """Lowest stage number that still has delta-v (i.e. the final propulsive stage)."""
     stages = [s for s in k.stages() if s["dv_vac"] > 1]
@@ -112,8 +127,15 @@ def _last_engine_stage(k: KSP) -> int:
 
 def ascend(k: KSP, altitude: float = 80000, heading: float = 90, turn_end: float | None = None,
            turn_speed: float = 60, turn_exponent: float = 0.5, max_aoa: float = 5, circularize: bool = True,
-           autostage_stop: int | None = None, launch: bool = True, min_tta: float = 30) -> dict:
-    """Launch (if on the pad) and fly a gravity turn to a circular orbit at `altitude` metres."""
+           autostage_stop: int | None = None, launch: bool = True, min_tta: float = 30,
+           max_drag: float | None = None, max_q: float | None = None, climb_tta: float = 25,
+           max_temp: float | None = None) -> dict:
+    """Launch (if on the pad) and fly a gravity turn to a circular orbit at `altitude` metres.
+
+    max_drag: throttle back while aerodynamic drag exceeds this fraction of the vessel's weight (thick
+    atmospheres such as Eve's, where flying faster than about terminal velocity wastes delta-v on drag).
+    max_q: throttle back while dynamic pressure exceeds this many kPa (limits drag losses and heating).
+    max_temp: throttle back while the hottest part is above this fraction of its temperature limit."""
     v = k.vessel()
     body = _body(k, v["body"])
     atmo = body["atmosphere_depth"]
@@ -121,6 +143,7 @@ def ascend(k: KSP, altitude: float = 80000, heading: float = 90, turn_end: float
         turn_end = atmo * 0.75 if atmo else max(altitude * 0.5, 8000)
     stop = autostage_stop if autostage_stop is not None else _last_engine_stage(k)
     watch = EventWatch(k)
+    set_control_surfaces(k, True)
     k.ap(mode="pitch_heading", pitch=90, heading=heading)
     if v["situation"] in ("PRELAUNCH", "LANDED", "SPLASHED"):
         k.autostage(on=False)  # plugin state can survive a revert; don't let it race the launch
@@ -166,14 +189,34 @@ def ascend(k: KSP, altitude: float = 80000, heading: float = 90, turn_end: float
             k.throttle(value=0)
             if alt > atmo:
                 break
-        elif ap > altitude * 0.95:
-            k.throttle(value=max(0.1, (altitude - ap) / (altitude * 0.05)))
         else:
-            k.throttle(value=1)
+            thr = max(0.1, (altitude - ap) / (altitude * 0.05)) if ap > altitude * 0.95 else 1.0
+            if max_drag is not None and v["max_thrust"] > 0:
+                weight = v["mass"] * v["local_gravity"]
+                excess = v["drag_kn"] - max_drag * weight
+                if excess > 0:
+                    # thrust for weight plus the allowed drag, less what the extra drag already costs
+                    want = weight * max(0.2, math.sin(math.radians(pitch))) + max_drag * weight - excess
+                    thr = min(thr, max(0.3, want / v["max_thrust"]))
+            if max_q is not None and v["max_thrust"] > 0 and v["dynamic_pressure_kpa"] > 0.8 * max_q:
+                # proportional: full thrust-to-weight margin at 0.8 max_q, hover-ish thrust at max_q, less above
+                weight = v["mass"] * v["local_gravity"] * max(0.2, math.sin(math.radians(pitch)))
+                frac = (v["dynamic_pressure_kpa"] - 0.8 * max_q) / (0.2 * max_q)
+                want = v["max_thrust"] * (1 - frac) + (weight + v["drag_kn"]) * frac
+                thr = min(thr, max(0.05, want / v["max_thrust"]))
+            if max_temp is not None and v.get("max_temp_frac", 0) > max_temp and v["dynamic_pressure_kpa"] > 1:
+                thr = min(thr, max(0.05, 1 - (v["max_temp_frac"] - max_temp) / 0.08))
+            if (max_q is not None or max_temp is not None) and v["max_thrust"] > 0:
+                # never throttle back so far that the climb stalls (pitch follows prograde down: death spiral)
+                tta = v["orbit"]["time_to_apoapsis"] if vs >= 0 and v["orbit"]["time_to_apoapsis"] is not None else 0.0
+                if ap < altitude and tta < climb_tta:
+                    thr = max(thr, min(1.0, (climb_tta - tta) / 10.0 + 0.3))
+            k.throttle(value=round(thr, 3))
 
         if time.time() - last_report > 5:
             last_report = time.time()
-            log(f"alt {alt/1000:6.1f} km  ap {ap/1000:6.1f} km  speed {spd:6.0f}  pitch {pitch:5.1f}  q {v['dynamic_pressure_kpa']:5.1f} kPa  stage {v['stage']}")
+            log(f"alt {alt/1000:6.1f} km  ap {ap/1000:6.1f} km  speed {spd:6.0f}  pitch {pitch:5.1f}  q {v['dynamic_pressure_kpa']:5.1f} kPa  "
+                f"drag {v.get('drag_kn', 0):6.0f} kN  temp {v.get('max_temp_frac', 0):.2f}  err {k.ap_status().get('error_deg')}  thr {v['control']['throttle']:.2f}  m {v['mass']:.1f} t  stage {v['stage']}")
         if v["situation"] in ("LANDED", "SPLASHED") and alt - h0 < 5 and spd < 1 and v["max_thrust"] == 0:
             raise MissionError("no thrust on the pad")
         time.sleep(0.2)
@@ -190,7 +233,7 @@ def execute_node(k: KSP, tolerance: float = 0.1, warp: bool = True, timeout: flo
     if not nodes:
         raise MissionError("no maneuver node")
     n = nodes[0]
-    log(f"executing node: dv {n['dv']:.1f} m/s in {n['in']:.0f}s (est. burn {n['burn_time_estimate']:.0f}s)")
+    log(f"executing node: dv {n['dv']:.1f} m/s in {n['in']:.0f}s (est. burn {n['burn_time_estimate'] or 0:.0f}s)")
     watch = EventWatch(k)
     k.node_exec(tolerance=tolerance, warp=warp)
     last, last_status = 0.0, ""
@@ -379,6 +422,161 @@ def reenter(k: KSP, periapsis: float = 30000, stage_to_capsule: bool = True, sep
     milestone_shot(k, "touchdown")
     log(f"down: {v['situation']} at {v['latitude']:.3f}, {v['longitude']:.3f}")
     return {"situation": v["situation"], "lat": v["latitude"], "lon": v["longitude"]}
+
+
+def descend(k: KSP, deorbit_pe: float = 40000, drogue_speed: float = 450, main_speed: float = 220,
+            drogues: str = "radialDrogue", mains: str = "parachuteRadial", keep_packed_on: str = "mk1pod",
+            touch_speed: float = 2.0, hiad_release_speed: float = 60, drop_shields_below: float = 400,
+            margin: float = 0.5, engine_stage: bool = False, powered: bool = False, entry_attitude: str = "srf_retrograde",
+            driver: str = "custom") -> dict:
+    """Land in a thick atmosphere (Eve): deorbit, enter engines-first holding surface retrograde, open the
+    drogues then the mains (only the named chute parts; a return capsule's own chute stays packed), release an
+    inflatable heat shield once slow, and touch down under the chutes holding the vessel upright.
+
+    powered=True flies the last part on the engines with the landing autopilot instead; don't use it with heat
+    shields under the engines (the exhaust destroys them)."""
+    v = k.vessel()
+    body = _body(k, v["body"])
+    atmo = body["atmosphere_depth"]
+    watch = EventWatch(k)
+    k.autostage(on=False)
+    if v["orbit"]["periapsis"] > atmo:
+        change_apsis(k, "periapsis", deorbit_pe, at="now")
+    k.ap(mode="retrograde")
+    n = set_control_surfaces(k, False)
+    if n:
+        log(f"  control surfaces disabled for the tail-first entry ({n} parts)")
+    # Engines with a part on their bottom node (a heat shield here) grow a shroud that wraps that part, which makes
+    # the engine the frontmost part and leaves it exposed; jettison the shrouds so the shields shade the engines.
+    # Only engines that have a heat shield below them (not an upper stage's engine, whose shroud fairs the
+    # interstage).
+    engines = k.call("parts", filter="LiquidEngine", modules=False)
+    first = max((x["stage"] for x in engines), default=0)
+    shielded = {x["id"] for x in engines if x["stage"] == first} if k.call("parts", filter="HeatShield2", modules=False) else set()
+    for p in k.call("parts", filter="LiquidEngine", modules=True):
+        if shielded and p["id"] not in shielded:
+            continue
+        for m in p["modules"]:
+            if m["module"] == "ModuleJettison" and any("JettisonAction" in a for a in m["actions"]):
+                try:
+                    k.call("part_action", part=p["id"], action="JettisonAction", module="ModuleJettison")
+                except Exception as e:
+                    log(f"  could not jettison the shroud of {p['name']}: {e}")
+    if k.call("parts", filter="InflatableHeatShield", modules=False):
+        try:
+            log(f"  inflating the heat shield: {k.call('part_event', part='InflatableHeatShield', event='Inflate Heat Shield', all=True)}")
+        except KSPError as e:
+            log(f"  heat shield not inflated ({e}); already inflated?")
+    v = k.vessel()
+    if v["altitude"] > atmo + 2000:
+        _warp_until(k, k.ut() + max(0, _time_to_altitude(k, atmo + 1000)), "atmosphere interface")
+    k.warp(index=0)
+    if entry_attitude == "free":
+        k.ap(mode="off")  # let aerodynamics orient the vehicle
+    else:
+        k.ap(mode=entry_attitude, driver=driver)
+    log(f"entering the atmosphere ({entry_attitude}, {driver} attitude control)")
+    last, peak_temp, peak_q = 0.0, 0.0, 0.0
+    drogues_armed = mains_armed = landing = staged_engines = hiad_released = shields_dropped = False
+    has_hiad = bool(k.call("parts", filter="InflatableHeatShield", modules=False))
+    name0 = v["name"]
+    while True:
+        watch.poll()
+        v = k.vessel()
+        if v["name"] != name0 or v["part_count"] == 0:
+            raise MissionError(f"lost the vessel during descent (now flying {v['name']!r}, {v['part_count']} parts)")
+        spd, radar = v["surface_speed"], v["radar_altitude"]
+        peak_temp, peak_q = max(peak_temp, v["max_temp_frac"]), max(peak_q, v["dynamic_pressure_kpa"])
+        if not drogues_armed and spd < drogue_speed and v["altitude"] < atmo * 0.7:
+            log(f"  arming drogues at {v['altitude'] / 1000:.1f} km, {spd:.0f} m/s: "
+                f"{k.call('parachutes', part=drogues, not_parent=keep_packed_on)}")
+            drogues_armed = True
+        if not mains_armed and spd < main_speed and v["altitude"] < atmo * 0.7:
+            log(f"  arming mains at {v['altitude'] / 1000:.1f} km, {spd:.0f} m/s: "
+                f"{k.call('parachutes', part=mains, not_parent=keep_packed_on)}")
+            mains_armed = True
+        if mains_armed and not hiad_released and spd < hiad_release_speed and has_hiad:
+            # under the mains the lander falls faster than the light, draggy HIAD, so it drifts away above us
+            # Release at the small decoupler under its girder when there is one: the inflated dish reaches down around
+            # the girder, and decoupling the HIAD itself makes the two collide.
+            try:
+                r = k.call("part_event", part="Decoupler.0", event="Decouple", all=True)
+            except KSPError:
+                r = k.call("part_event", part="InflatableHeatShield", event="Jettison Heat Shield", all=True)
+            log(f"  releasing the inflatable heat shield at {radar:.0f} m, {spd:.0f} m/s: {r}")
+            hiad_released = True
+            if not powered:
+                k.ap(mode="up")  # hang upright under the chutes
+        if (not shields_dropped and hiad_released and radar < drop_shields_below and spd < 30
+                and k.call("parts", filter="HeatShield2", modules=False)):
+            # the heat shields under the engines can't take a ~9 m/s touchdown (the engines can): drop them now;
+            # they fall faster than the lander under its chutes and land first
+            log(f"  dropping the heat shields at {radar:.0f} m: "
+                f"{k.call('part_event', part='HeatShield2', event='Jettison Heat Shield', all=True)}")
+            shields_dropped = True
+        if powered and not landing and mains_armed and v["vertical_speed"] < 0:
+            # hand over to the landing autopilot early enough to stop from the current speed
+            prop_a = max(1e-3, v["max_thrust"] / v["mass"]) if v["max_thrust"] > 0 else None
+            if engine_stage and not prop_a:
+                if staged_engines:
+                    raise MissionError("staged for the landing engines but there is still no thrust available")
+                log(f"  lighting the landing engines (stage {v['stage']})")
+                k.throttle(value=0)
+                k.stage()
+                staged_engines = True
+                time.sleep(1.5)
+                continue
+            if prop_a and radar < max(300.0, 3 * spd * spd / (2 * max(0.5, prop_a * 0.5 - v["local_gravity"]))):
+                log(f"  powered landing from {radar:.0f} m at {spd:.1f} m/s")
+                k.land(touch_speed=touch_speed, margin=margin)
+                landing = True
+        if v["situation"] in ("LANDED", "SPLASHED") and spd < 1.0:
+            if not landing or k.ap_status().get("land") in ("landed", None) or k.ap_status()["mode"] == "off":
+                break
+        if time.time() - last > 4:
+            last = time.time()
+            hot = ""
+            if mains_armed:
+                st = k.call("parachutes", part=mains, not_parent=keep_packed_on, report=True)["chutes"]
+                states = {}
+                for c in st:
+                    key = c.split(": ")[1].split(" ")[0]
+                    states[key] = states.get(key, 0) + 1
+                hot += f"parts {v['part_count']} mains {states}  "
+            if v["max_temp_frac"] > 0.8:
+                h = k.call("temps", n=1)[0]
+                hot = f"(hottest {h['part']} skin {h['skin']:.0f}/{h['skin_max']:.0f} K, int {h['temp']:.0f}/{h['max']:.0f})  "
+            log(f"  alt {v['altitude'] / 1000:6.2f} km  radar {radar:7.0f}  speed {spd:6.1f}  vs {v['vertical_speed']:6.1f}  {hot}"
+                f"q {v['dynamic_pressure_kpa']:6.1f}  temp {v['max_temp_frac']:.2f}  err {k.ap_status().get('error_deg')}  "
+                f"{k.ap_status().get('land', '') if landing else ''}")
+        time.sleep(0.3)
+    k.ap(mode="off")
+    k.throttle(value=0)
+    time.sleep(2)
+    v = k.vessel()
+    milestone_shot(k, "landed")
+    log(f"landed: {v['situation']} on {v['body']} at {v['latitude']:.3f}, {v['longitude']:.3f}, {v['altitude']:.0f} m "
+        f"({v['biome']}); peak temp {peak_temp:.2f}, peak q {peak_q:.0f} kPa")
+    return {"situation": v["situation"], "lat": v["latitude"], "lon": v["longitude"], "altitude": v["altitude"],
+            "peak_temp": peak_temp, "parts": v["part_count"]}
+
+
+def eve_ascent(k: KSP, altitude: float = 100000, turn_end: float = 65000, turn_exponent: float = 0.8,
+               max_q: float = 110, max_aoa: float = 5, max_temp: float = 0.85, climb_tta: float = 15) -> dict:
+    """Lift the Eve lander off the surface into orbit: drop the landing-only parts (the uprighting chutes on their
+    decouplers, anything left on the pod's top decoupler, heat shields), then fly a drag- and heat-limited ascent."""
+    v = k.vessel()
+    if v["situation"] not in ("LANDED", "SPLASHED", "PRELAUNCH"):
+        raise MissionError(f"eve_ascent starts on the surface, not {v['situation']}")
+    for part, event in (("radialDecoupler", "Decouple"), ("Decoupler.0", "Decouple"), ("HeatShield2", "Jettison Heat Shield")):
+        try:
+            r = k.call("part_event", part=part, event=event, all=True)
+            log(f"  dropped {part}: {len(r)} parts")
+        except KSPError:
+            pass
+    time.sleep(2)
+    return ascend(k, altitude=altitude, turn_end=turn_end, turn_exponent=turn_exponent, max_q=max_q,
+                  max_aoa=max_aoa, max_temp=max_temp, climb_tta=climb_tta)
 
 
 def return_home(k: KSP, periapsis: float = 30000) -> dict:
@@ -684,6 +882,8 @@ ROUTINES = {
     "warp_to_soi": warp_to_soi,
     "transfer": transfer,
     "land": land,
+    "descend": descend,
+    "eve_ascent": eve_ascent,
     "reenter": reenter,
     "return_home": return_home,
     "plan_interplanetary": plan_interplanetary,
